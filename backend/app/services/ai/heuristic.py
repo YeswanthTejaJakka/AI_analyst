@@ -1,6 +1,18 @@
+"""
+Heuristic (Deterministic) AI Provider for QueryPilot.
+
+Implements the full LLMProvider interface without any LLM API calls.
+Used in test/offline mode and as fallback within the Gemini/OpenAI providers.
+
+Design principles (update.txt Section 0):
+- No raw keyword lookup tables for intent — use structured pattern recognition
+- LLM proposes; this engine deterministically validates and structures
+- Produce the same QueryIntent/ResultContext types as the LLM providers
+"""
 import json
 import re
 from typing import Any, Optional
+
 from app.models.chat import (
     AmbiguityItem,
     ClarificationContext,
@@ -8,511 +20,677 @@ from app.models.chat import (
     QueryClassificationEnum,
     QueryIntent,
     ResultContext,
+    ScopeEnum,
 )
 from app.models.schema import DatabaseSchema
 from app.services.ai.base import LLMProvider
 
 
-class QueryClassifier:
-    """Classifies user queries BEFORE SQL generation into query relation types."""
+# ---------------------------------------------------------------------------
+# Internal helpers – not exported
+# ---------------------------------------------------------------------------
 
-    @staticmethod
+_DESTRUCTIVE_OPS = re.compile(
+    r"\b(drop|delete|truncate|update|insert\s+into|alter\s+table|create\s+table|grant|revoke)\b",
+    re.I,
+)
+
+_LIMIT_RE = re.compile(r"\btop\s+(\d+)\b", re.I)
+_COUNTRY_RE = re.compile(
+    r"\b(india|united\s+states|usa|united\s+kingdom|uk|germany|canada|australia|"
+    r"japan|france|singapore|brazil)\b",
+    re.I,
+)
+_YEAR_RE = re.compile(r"\b(20\d{2})\b")
+_CUSTOMER_ID_RE = re.compile(r"\bcustomer\s+(\d+)\b", re.I)
+_NUM_RE = re.compile(r"(?:above|over|>|greater\s+than)?\s*\$?\s*(\d+(?:\.\d+)?)")
+
+# Map country mention → canonical name
+_COUNTRY_MAP = {
+    "india": "India",
+    "united states": "United States",
+    "usa": "United States",
+    "united kingdom": "United Kingdom",
+    "uk": "United Kingdom",
+    "germany": "Germany",
+    "canada": "Canada",
+    "australia": "Australia",
+    "japan": "Japan",
+    "france": "France",
+    "singapore": "Singapore",
+    "brazil": "Brazil",
+}
+
+
+def _extract_country(q: str) -> Optional[str]:
+    m = _COUNTRY_RE.search(q)
+    if m:
+        return _COUNTRY_MAP.get(m.group(1).lower())
+    return None
+
+
+def _extract_limit(q: str) -> Optional[int]:
+    m = _LIMIT_RE.search(q)
+    return int(m.group(1)) if m else None
+
+
+def _extract_year(q: str) -> Optional[str]:
+    m = _YEAR_RE.search(q)
+    return m.group(1) if m else None
+
+
+# ---------------------------------------------------------------------------
+# QueryClassifier
+# ---------------------------------------------------------------------------
+
+class QueryClassifier:
+    """Classifies user query turns relative to conversation state."""
+
+    # Patterns that strongly indicate the user is referencing the previous result
+    _REFERENCE_PATTERNS = [
+        r"\b(it|its|their|them|they|those|these|her|his|him)\b",
+        r"\b(the\s+)?(first|second|third|fourth|fifth|last)\s+one\b",
+        r"\b(2nd|3rd|4th|5th)\s+one\b",
+        r"\brunner[\s-]?up\b",
+        r"\bthat\s+(category|product|customer|order)\b",
+        r"\bfrom\s+them\b",
+        r"\bby\s+(her|him|them)\b",
+        r"\bhow\s+many\s+(are\s+there|of\s+them)\b",
+    ]
+    _REF_RE = re.compile("|".join(_REFERENCE_PATTERNS), re.I)
+
+    # Patterns that indicate a refinement (parameter change, scope adjustment)
+    _REFINEMENT_PATTERNS = [
+        r"\bmake\s+that\b", r"\bchange\s+that\s+to\b", r"\bonly\s+top\b",
+        r"\bcategory\s+wise\b", r"\bper\s+category\b",
+        r"\bi\s+am\s+asking\s+total\b", r"\bjust\s+the\s+total\b",
+        r"\bonly\s+(completed|from|in)\b", r"\bfilter\s+by\b",
+        r"\bby\s+order\s+count\b", r"\bby\s+revenue\b",
+        r"\bnot\s+(spending|revenue|orders|that)\b",
+    ]
+    _REFINE_RE = re.compile("|".join(_REFINEMENT_PATTERNS), re.I)
+
+    _CORRECTION_PATTERNS = [
+        r"\bi\s+meant\b", r"\bi\s+mean\b", r"\bi\s+am\s+asking\b",
+        r"\bnot\s+this\b", r"\bnot\s+that\b", r"\binstead\b",
+        r"\bactually\b", r"\brather\s+than\b",
+    ]
+    _CORRECT_RE = re.compile("|".join(_CORRECTION_PATTERNS), re.I)
+
+    _SWITCH_PATTERNS = [
+        r"\bforget\s+(that|about\s+it)\b", r"\bnever\s+mind\b",
+        r"\bstart\s+over\b", r"\bnew\s+topic\b", r"\bclear\s+context\b",
+        r"\blet'?s?\s+switch\b", r"\bnow\s+let'?s?\s+look\s+at\b",
+    ]
+    _SWITCH_RE = re.compile("|".join(_SWITCH_PATTERNS), re.I)
+
+    @classmethod
     def classify(
+        cls,
         query: str,
         previous_intent: Optional[QueryIntent],
         previous_result_context: Optional[ResultContext],
         schema: DatabaseSchema,
         in_clarification: bool = False,
     ) -> QueryClassificationEnum:
-        q_lower = query.lower().strip()
+        q = query.strip()
 
-        # If in clarification, assume it's a response UNLESS it explicitly matches a new query pattern
-        is_clarification = in_clarification
+        # Priority 1: pending clarification overrides most things
+        if in_clarification:
+            if cls._SWITCH_RE.search(q):
+                return QueryClassificationEnum.CONTEXT_SWITCH
+            return QueryClassificationEnum.CLARIFICATION_RESPONSE
 
-        # Pronoun & Entity References indicating Follow-up
-        followup_patterns = [
-            r"\bits\b", r"\bher\b", r"\bhis\b", r"\bhim\b",
-            r"\btheir\b", r"\bthem\b", r"\bthose\b", r"\bthese\b", r"\bthey\b",
-            r"\bthe second one\b", r"\b2nd one\b", r"\brunner up\b",
-            r"\bhow many are there\b", r"\bhow many of them\b", r"\bcount them\b",
-            r"\bonly from\b", r"\bonly in\b", r"\bonly this year\b", r"\bfilter by\b",
-            r"\bfrom them\b", r"\bby her\b", r"\bby him\b", r"\bby them\b",
-            r"\bi am asking\b", r"\bi meant\b", r"\bmake that\b", r"\bactually\b",
-            r"\bnot this\b", r"\bnot that\b", r"\binstead\b",
-            r"\bcategory wise\b", r"\bper category\b",
-            r"\bwhat about\b", r"\bwhat category\b",
-        ]
-        for pattern in followup_patterns:
-            if re.search(pattern, q_lower):
-                return QueryClassificationEnum.FOLLOW_UP
+        # Priority 2: context switch
+        if cls._SWITCH_RE.search(q):
+            return QueryClassificationEnum.CONTEXT_SWITCH
 
-        # Context switches that force a new query
-        context_switch_patterns = [
-            r"\bforget that\b", r"\bnever mind\b", r"\bstart over\b",
-            r"\bnow let'?s look at\b", r"\blet'?s switch\b",
-        ]
-        for pattern in context_switch_patterns:
-            if re.search(pattern, q_lower):
-                return QueryClassificationEnum.NEW_QUERY
+        # Priority 3: correction
+        if cls._CORRECT_RE.search(q):
+            return QueryClassificationEnum.CORRECTION
 
-        # Check for explicit new query indicators
-        new_query_patterns = [
-            r"\bmost expensive product\b", r"\bhighest priced product\b", r"\bpriciest product\b",
-            r"\bcosts the most\b", r"\bmaximum price\b", r"\bexpensive products\b",
-            r"\bshow customers from\b", r"\bshow products\b", r"\bshow categories\b",
-        ]
-        for pattern in new_query_patterns:
-            if re.search(pattern, q_lower):
-                return QueryClassificationEnum.NEW_QUERY
+        # Priority 4: refinement
+        if cls._REFINE_RE.search(q):
+            return QueryClassificationEnum.QUERY_REFINEMENT
 
-        # Check if previous entity was customer/order and new query is about products, or vice versa
-        if previous_intent and previous_intent.entity:
-            prev_e = previous_intent.entity.lower()
-            if "product" in q_lower and prev_e != "product" and not any(p in q_lower for p in ["their", "them", "those"]):
-                return QueryClassificationEnum.NEW_QUERY
-            if "customer" in q_lower and prev_e != "customer" and not any(p in q_lower for p in ["their", "them", "those"]):
-                return QueryClassificationEnum.NEW_QUERY
+        # Priority 5: result reference (pronouns / demonstratives)
+        if cls._REF_RE.search(q):
+            return QueryClassificationEnum.RESULT_REFERENCE
 
-        # If previous query was "categories of products" and user asks "what about their price?", it's a FOLLOW_UP
-        if previous_intent and (previous_intent.entity == "category" or "category" in q_lower or "categories" in q_lower) and "price" in q_lower:
+        # Priority 6: elliptical follow-up ("what about India?", "and for 2025?")
+        if previous_intent and re.match(
+            r"^(what\s+about|how\s+about|and\s+for|and\s+in|and\s+with)\b", q, re.I
+        ):
             return QueryClassificationEnum.FOLLOW_UP
 
-        if is_clarification:
-            return QueryClassificationEnum.CLARIFICATION_RESPONSE
+        # Priority 7: entity switch → always a NEW_QUERY
+        if previous_intent and previous_intent.entity:
+            prev_e = previous_intent.entity.lower().rstrip("s")
+            query_lower = q.lower()
+            new_entities = {
+                "product": ["product", "item", "sku"],
+                "customer": ["customer", "buyer", "client"],
+                "category": ["category", "categories"],
+                "order": ["order", "purchase", "transaction"],
+            }
+            for entity, keywords in new_entities.items():
+                if entity != prev_e and any(kw in query_lower for kw in keywords):
+                    # Only a NEW_QUERY if not also referencing previous (pronouns check)
+                    if not cls._REF_RE.search(q):
+                        return QueryClassificationEnum.NEW_QUERY
 
         return QueryClassificationEnum.NEW_QUERY
 
 
-class QueryAnalyzer:
-    """Performs intent extraction, ambiguity detection, and clarification resolution."""
+# ---------------------------------------------------------------------------
+# QueryAnalyzer
+# ---------------------------------------------------------------------------
 
-    @staticmethod
+class QueryAnalyzer:
+    """Extracts structured QueryIntent from natural-language text using heuristic pattern matching."""
+
+    @classmethod
     def analyze_intent(
+        cls,
         query: str,
         schema: DatabaseSchema,
         classification: QueryClassificationEnum,
         previous_intent: Optional[QueryIntent] = None,
         previous_result_context: Optional[ResultContext] = None,
     ) -> QueryIntent:
-        q_lower = query.lower().strip()
-        table_names = [t.name.lower() for t in schema.tables]
+        q = query.lower().strip()
 
-        # 1. Dangerous queries check
-        destructive_keywords = ["drop", "delete", "truncate", "update", "insert", "alter", "create table", "grant", "revoke"]
-        for kw in destructive_keywords:
-            if re.search(rf"\b{kw}\b", q_lower):
-                return QueryIntent(
-                    operation="rejected",
-                    unsupported_reason=f"Destructive operation detected ('{kw}'). QueryPilot only executes safe, read-only queries.",
-                    is_ambiguous=False,
-                )
+        # ── Safety: destructive operations ──────────────────────────────
+        if _DESTRUCTIVE_OPS.search(q):
+            kw = _DESTRUCTIVE_OPS.search(q).group(1)  # type: ignore[union-attr]
+            return QueryIntent(
+                operation="rejected",
+                unsupported_reason=(
+                    f"Destructive operation detected ('{kw}'). "
+                    "QueryPilot only executes safe, read-only queries."
+                ),
+            )
 
-        # 2. Check for Unknown Schema Entities
-        unknown_entities = ["supplier", "employee", "warehouse", "subscription", "shipment", "vendor", "payroll"]
+        # ── Safety: unknown entities not in schema ───────────────────────
+        schema_tables = {t.name.lower() for t in schema.tables}
+        unknown_entities = {"supplier", "employee", "warehouse", "subscription", "shipment", "vendor", "payroll"}
         for ue in unknown_entities:
-            if ue in q_lower and ue not in table_names and f"{ue}s" not in table_names:
+            if ue in q and ue not in schema_tables and f"{ue}s" not in schema_tables:
                 return QueryIntent(
                     operation="unknown_entity",
-                    unsupported_reason=f"I couldn't find a table or entity representing '{ue}s' in the database schema.",
-                    is_ambiguous=False,
+                    unsupported_reason=(
+                        f"I couldn't find a table or entity representing '{ue}' in the database schema."
+                    ),
                 )
 
-        # 3. Handle NEW_QUERY: Completely reset previous intent! No contamination of metrics or joins!
-        if classification == QueryClassificationEnum.NEW_QUERY:
-            intent = QueryIntent(is_ambiguous=False)
+        # ── Route by classification ──────────────────────────────────────
+        if classification in (QueryClassificationEnum.CONTEXT_SWITCH, QueryClassificationEnum.NEW_QUERY):
+            return cls._new_query_intent(q, schema)
 
-            # High price / Expensive products variations
-            if any(p in q_lower for p in ["highest priced", "most expensive", "priciest", "costs the most", "maximum price"]):
-                intent.entity = "product"
-                intent.operation = "ranking"
-                intent.primary_metric = "price"
-                intent.sort_column = "price"
-                intent.sort_direction = "descending"
-                intent.limit = 1
-                return intent
+        if classification in (
+            QueryClassificationEnum.FOLLOW_UP,
+            QueryClassificationEnum.QUERY_REFINEMENT,
+            QueryClassificationEnum.CORRECTION,
+            QueryClassificationEnum.RESULT_REFERENCE,
+        ):
+            return cls._follow_up_intent(q, schema, previous_intent, previous_result_context)
 
-            if ("expensive" in q_lower and ("product" in q_lower or "item" in q_lower)) and not any(p in q_lower for p in ["highest priced", "most expensive", "priciest", "costs the most", "maximum price"]):
-                intent.entity = "product"
-                intent.operation = "filter"
-                intent.primary_metric = "price"
-                intent.is_ambiguous = True
-                intent.ambiguities = [
-                    AmbiguityItem(
-                        field="price_threshold",
-                        type="threshold",
-                        reason="What qualifies as 'expensive' depends on the price threshold.",
-                        options=["Price > $100", "Price > $500", "Top 10% highest priced", "Above average price"],
-                    )
-                ]
-                intent.clarification = ClarificationRequest(
-                    question="What price qualifies as 'expensive'?",
-                    options=["Price > $100", "Price > $500", "Top 10% highest priced", "Above average price"],
-                    field_name="price_threshold",
-                )
-                return intent
+        # Fallback: treat as new query
+        return cls._new_query_intent(q, schema)
 
-            # Entity identification
-            if "category" in q_lower or "categories" in q_lower:
+    # ------------------------------------------------------------------
+    # New Query intent extraction
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _new_query_intent(cls, q: str, schema: DatabaseSchema) -> QueryIntent:
+        intent = QueryIntent()
+        intent.filters = {}
+
+        # ── Limit / country / year ───────────────────────────────────────
+        limit = _extract_limit(q)
+        country = _extract_country(q)
+        year = _extract_year(q)
+        if country:
+            intent.filters["country"] = country
+        if year:
+            intent.time_range = year
+
+        # ── Customer ID ─────────────────────────────────────────────────
+        cid = _CUSTOMER_ID_RE.search(q)
+        if cid:
+            intent.entity = "customer"
+            intent.filters["id"] = int(cid.group(1))
+
+        # ── Explicit entity detection ────────────────────────────────────
+        if not intent.entity:
+            if "categor" in q:
                 intent.entity = "category"
-            elif "customer" in q_lower:
+            elif "customer" in q or "buyer" in q:
                 intent.entity = "customer"
-            elif "product" in q_lower or "item" in q_lower:
+            elif "product" in q or "item" in q:
                 intent.entity = "product"
-            elif "order" in q_lower:
+            elif "order" in q:
                 intent.entity = "order"
 
-            # Ambiguity checks for NEW_QUERY
-            if "best customer" in q_lower or "best customers" in q_lower:
-                intent.entity = "customer"
-                intent.operation = "ranking"
-                intent.is_ambiguous = True
-                intent.ambiguities = [
-                    AmbiguityItem(
-                        field="metric",
-                        type="metric",
-                        reason="The word 'best customer' has multiple possible business interpretations.",
-                        options=[
-                            "Highest total spending",
-                            "Most orders placed",
-                            "Most products purchased",
-                            "Highest average order value",
-                        ],
-                    )
-                ]
-                intent.clarification = ClarificationRequest(
-                    question="What do you mean by 'best customer'?",
-                    options=[
-                        "Highest total spending",
-                        "Most orders placed",
-                        "Most products purchased",
-                        "Highest average order value",
-                    ],
-                    field_name="metric",
+        # ── Ambiguous queries ────────────────────────────────────────────
+
+        # "best customer" is ambiguous on metric
+        if re.search(r"\bbest\s+customers?\b", q):
+            intent.entity = "customer"
+            intent.operation = "ranking"
+            intent.is_ambiguous = True
+            intent.ambiguities = [
+                AmbiguityItem(
+                    field="metric",
+                    type="metric",
+                    reason="'best customer' can be measured by spending, order count, or average order value.",
+                    options=["Highest total spending", "Most orders placed", "Highest average order value"],
                 )
-                return intent
-
-            if "popular" in q_lower:
-                intent.entity = "product"
-                intent.operation = "ranking"
-                intent.is_ambiguous = True
-                intent.ambiguities = [
-                    AmbiguityItem(
-                        field="metric",
-                        type="metric",
-                        reason="The term 'popular' could mean most units sold, most orders, or highest revenue.",
-                        options=["Highest units sold", "Most orders placed", "Highest revenue"],
-                    )
-                ]
-                intent.clarification = ClarificationRequest(
-                    question="What metric should I use for 'popular' products?",
-                    options=["Highest units sold", "Most orders placed", "Highest revenue"],
-                    field_name="metric",
-                )
-                return intent
-
-            if re.search(r"\brecent(?:ly)?\b", q_lower) and not any(k in q_lower for k in ["day", "month", "year", "2024", "2025", "2026"]):
-                intent.entity = "customer" if "customer" in q_lower else "order"
-                intent.operation = "filter"
-                intent.is_ambiguous = True
-                intent.ambiguities = [
-                    AmbiguityItem(
-                        field="time_range",
-                        type="time",
-                        reason="The term 'recent' does not specify an exact timeframe.",
-                        options=["Last 7 days", "Last 30 days", "Last 90 days", "This year"],
-                    )
-                ]
-                intent.clarification = ClarificationRequest(
-                    question="How recent should 'recently' mean?",
-                    options=["Last 7 days", "Last 30 days", "Last 90 days", "This year"],
-                    field_name="time_range",
-                )
-                return intent
-
-            # Limit parsing
-            limit_match = re.search(r"\btop\s+(\d+)\b", q_lower)
-            if limit_match:
-                intent.limit = int(limit_match.group(1))
-
-            # Country filter
-            for country in ["India", "United States", "United Kingdom", "Germany", "Canada", "Australia", "Japan", "France", "Singapore", "Brazil"]:
-                if country.lower() in q_lower:
-                    intent.filters["country"] = country
-
-            # Metrics & Operations
-            if "how many" in q_lower or "count" in q_lower:
-                intent.operation = "count"
-            elif "revenue" in q_lower or "sales" in q_lower:
-                intent.operation = "aggregation"
-                intent.primary_metric = "revenue"
-            elif "spending" in q_lower or "spent" in q_lower:
-                intent.operation = "ranking" if intent.limit else "aggregation"
-                intent.primary_metric = "spending"
-            elif "units sold" in q_lower or "sold" in q_lower:
-                intent.operation = "ranking" if intent.limit else "aggregation"
-                intent.primary_metric = "units_sold"
-            elif "orderes" in q_lower or "orders" in q_lower:
-                if intent.operation == "ranking":
-                    intent.primary_metric = "order_count"
-            
-            # Explicit customer ID matching
-            id_match = re.search(r"customer (\d+)", q_lower)
-            if id_match:
-                intent.entity = "customer"
-                intent.filters["id"] = int(id_match.group(1))
-
-            if "category wise" in q_lower or "per category" in q_lower:
-                intent.entity = "category"
-                intent.group_by = ["category"]
-
+            ]
+            intent.clarification = ClarificationRequest(
+                field_name="metric",
+                question="What defines the 'best customer'?",
+                options=["Highest total spending", "Most orders placed", "Highest average order value"],
+            )
             return intent
 
-        # 4. Handle FOLLOW_UP: Inherit context selectively!
-        if classification == QueryClassificationEnum.FOLLOW_UP:
-            if not previous_intent:
-                # Fallback to new query if no previous intent
-                return QueryAnalyzer.analyze_intent(query, schema, QueryClassificationEnum.NEW_QUERY)
-
-            # Follow-up: "its sales" -> Clarification on "sales"
-            if "its sales" in q_lower:
-                new_intent = previous_intent.model_copy(deep=True)
-                new_intent.is_ambiguous = True
-                new_intent.ambiguities = [
-                    AmbiguityItem(
-                        field="metric",
-                        type="metric",
-                        reason="The term 'sales' is ambiguous.",
-                        options=["Total Revenue", "Units Sold"],
-                    )
-                ]
-                new_intent.clarification = ClarificationRequest(
-                    question="What do you mean by 'sales'?",
-                    options=["Total Revenue", "Units Sold"],
-                    field_name="metric",
+        # "popular" product is ambiguous on metric
+        if re.search(r"\bpopular\b", q):
+            intent.entity = "product"
+            intent.operation = "ranking"
+            intent.is_ambiguous = True
+            intent.ambiguities = [
+                AmbiguityItem(
+                    field="metric",
+                    type="metric",
+                    reason="'popular' can mean most units sold, most orders, or highest revenue.",
+                    options=["Highest units sold", "Most orders placed", "Highest revenue"],
                 )
-                if previous_result_context and previous_result_context.returned_ids:
-                    new_intent.referenced_ids = previous_result_context.returned_ids
-                return new_intent
+            ]
+            intent.clarification = ClarificationRequest(
+                field_name="metric",
+                question="What metric should I use for 'popular' products?",
+                options=["Highest units sold", "Most orders placed", "Highest revenue"],
+            )
+            return intent
 
-            # Follow-up: "revenue we get from them" -> sum of revenue for referenced IDs
-            if "revenue we get from them" in q_lower:
-                new_intent = previous_intent.model_copy(deep=True)
-                new_intent.primary_metric = "revenue"
-                new_intent.operation = "aggregation"
-                if previous_result_context and previous_result_context.returned_ids:
-                    new_intent.referenced_ids = previous_result_context.returned_ids
-                new_intent.is_ambiguous = False
-                new_intent.clarification = None
-                return new_intent
+        # "expensive" without a clear threshold
+        if re.search(r"\bexpensive\b", q) and not re.search(
+            r"\b(highest[\s-]?priced|most\s+expensive|priciest|costs?\s+the\s+most|maximum\s+price)\b", q
+        ):
+            intent.entity = "product"
+            intent.operation = "filter"
+            intent.primary_metric = "price"
+            intent.is_ambiguous = True
+            intent.ambiguities = [
+                AmbiguityItem(
+                    field="price_threshold",
+                    type="threshold",
+                    reason="What qualifies as 'expensive' depends on the price threshold.",
+                    options=["Price > $100", "Price > $500", "Top 10% highest priced", "Above average price"],
+                )
+            ]
+            intent.clarification = ClarificationRequest(
+                field_name="price_threshold",
+                question="What price qualifies as 'expensive'?",
+                options=["Price > $100", "Price > $500", "Top 10% highest priced", "Above average price"],
+            )
+            return intent
 
-            # Follow-up: "total revenue generated by her" -> preserve filters
-            if "total revenue generated by her" in q_lower:
-                new_intent = previous_intent.model_copy(deep=True)
-                new_intent.primary_metric = "revenue"
-                new_intent.operation = "aggregation"
-                new_intent.is_ambiguous = False
-                new_intent.clarification = None
-                return new_intent
+        # "recent" without explicit timeframe
+        if re.search(r"\brecently?\b", q) and not re.search(
+            r"\b(day|week|month|year|20\d{2})\b", q
+        ):
+            intent.entity = "customer" if "customer" in q else "order"
+            intent.operation = "filter"
+            intent.is_ambiguous = True
+            intent.ambiguities = [
+                AmbiguityItem(
+                    field="time_range",
+                    type="time",
+                    reason="'Recent' does not specify an exact timeframe.",
+                    options=["Last 7 days", "Last 30 days", "Last 90 days", "This year"],
+                )
+            ]
+            intent.clarification = ClarificationRequest(
+                field_name="time_range",
+                question="How recent should 'recent' be?",
+                options=["Last 7 days", "Last 30 days", "Last 90 days", "This year"],
+            )
+            return intent
 
-            # Refinement: "make that top 5" / "actually make that top 5" / "top 5 instead"
-            limit_refinement = re.search(r"(?:make that|make it|top)\s+(\d+)", q_lower)
-            if limit_refinement:
-                new_intent = previous_intent.model_copy(deep=True)
-                new_intent.limit = int(limit_refinement.group(1))
-                new_intent.is_ambiguous = False
-                new_intent.clarification = None
-                return new_intent
+        # ── Clear intent: operation + metric ─────────────────────────────
 
-            # Refinement: "by order count, not spending" / "by revenue, not orders"
-            if "not spending" in q_lower or "not revenue" in q_lower or "not orders" in q_lower:
-                new_intent = previous_intent.model_copy(deep=True)
-                if "order count" in q_lower or "number of orders" in q_lower:
-                    new_intent.primary_metric = "order_count"
-                elif "revenue" in q_lower:
-                    new_intent.primary_metric = "revenue"
-                elif "spending" in q_lower or "spent" in q_lower:
-                    new_intent.primary_metric = "spending"
-                elif "units sold" in q_lower:
-                    new_intent.primary_metric = "units_sold"
-                new_intent.is_ambiguous = False
-                new_intent.clarification = None
-                return new_intent
+        # Superlatives → ranking of 1
+        if re.search(r"\b(highest[\s-]?priced|most\s+expensive|priciest|costs?\s+the\s+most|maximum\s+price)\b", q):
+            intent.entity = "product"
+            intent.operation = "ranking"
+            intent.primary_metric = "price"
+            intent.sort_column = "price"
+            intent.sort_direction = "descending"
+            intent.limit = 1
+            return intent
 
-            # Follow-up: "i am asking total"
-            if "total" in q_lower and previous_intent.operation == "aggregation":
-                new_intent = previous_intent.model_copy(deep=True)
-                new_intent.group_by = []
-                new_intent.is_ambiguous = False
-                new_intent.clarification = None
-                return new_intent
+        # Count queries
+        if re.search(r"\b(how\s+many|count)\b", q):
+            intent.operation = "count"
 
-            # Follow-up: "What about the second one?"
-            if any(phrase in q_lower for phrase in ["second one", "second highest", "second best", "2nd one", "runner up"]):
-                new_intent = previous_intent.model_copy(deep=True)
-                new_intent.limit = 1
-                new_intent.offset = 1
-                new_intent.is_ambiguous = False
-                new_intent.clarification = None
-                return new_intent
+        # Revenue / total sales
+        elif re.search(r"\b(revenue|total\s+sales)\b", q):
+            intent.operation = "aggregation"
+            intent.primary_metric = "revenue"
 
-            # Follow-up: "How many are there?" -> preserve filters, count
-            if "how many" in q_lower or "count" in q_lower:
-                new_intent = previous_intent.model_copy(deep=True)
-                new_intent.operation = "count"
-                new_intent.limit = None
-                new_intent.offset = None
-                new_intent.is_ambiguous = False
-                new_intent.clarification = None
-                return new_intent
+        # Spending
+        elif re.search(r"\b(spending|spent)\b", q):
+            intent.operation = "ranking" if limit else "aggregation"
+            intent.primary_metric = "spending"
+            if not limit:
+                limit = 10
 
-            # Follow-up: "What are their prices?" / "their price"
-            if "their price" in q_lower or "their prices" in q_lower or ("price" in q_lower and any(p in q_lower for p in ["their", "them", "those"])):
-                if previous_intent.entity == "category" or previous_intent.operation == "list":
-                    return QueryIntent(
-                        entity="category",
-                        operation="aggregation",
-                        is_ambiguous=True,
-                        ambiguities=[
-                            AmbiguityItem(
-                                field="category_price_aggregation",
-                                type="missing_attribute",
-                                reason="Categories do not have a direct price column. Price is stored on products.",
-                                options=["Prices of products in each category", "Average product price per category", "Minimum and maximum product price per category"],
-                            )
+        # Units sold
+        elif re.search(r"\b(units?\s+sold|sold)\b", q):
+            intent.operation = "ranking" if limit else "aggregation"
+            intent.primary_metric = "units_sold"
+
+        # Orders (as metric)
+        elif re.search(r"\bmost\s+orders?\b", q):
+            intent.operation = "ranking"
+            intent.primary_metric = "order_count"
+            if not limit:
+                limit = 10
+
+        # Grouping
+        if re.search(r"\b(category[\s-]?wise|per\s+category|by\s+category)\b", q):
+            intent.entity = "category"
+            intent.group_by = "category"
+
+        intent.limit = limit
+        return intent
+
+    # ------------------------------------------------------------------
+    # Follow-up / Refinement / Reference intent extraction
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _follow_up_intent(
+        cls,
+        q: str,
+        schema: DatabaseSchema,
+        previous_intent: Optional[QueryIntent],
+        previous_result_context: Optional[ResultContext],
+    ) -> QueryIntent:
+        if not previous_intent:
+            return cls._new_query_intent(q, schema)
+
+        intent = previous_intent.model_copy(deep=True)
+        intent.is_ambiguous = False
+        intent.clarification = None
+
+        # Resolve pronoun reference IDs
+        if previous_result_context and previous_result_context.returned_ids:
+            if re.search(r"\b(their|them|those|these|her|his|him)\b", q):
+                intent.referenced_ids = list(previous_result_context.returned_ids)
+                intent.target_entity_ids = list(previous_result_context.returned_ids)
+                intent.scope = ScopeEnum.PREVIOUS_RESULT_SET
+
+        # "second one" / "runner-up"
+        if re.search(r"\b(second|2nd)\s+(one|highest|best|largest)\b|\brunner[\s-]?up\b", q):
+            intent.limit = 1
+            intent.offset = 1
+            return intent
+
+        # "make that top N" / "show top N"
+        limit_m = re.search(r"\b(?:make\s+(?:it|that)|show|give\s+me|top)\s+(\d+)\b", q)
+        if limit_m:
+            intent.limit = int(limit_m.group(1))
+            return intent
+
+        # "how many" / "count them" → switch to count, preserve filters + scope
+        if re.search(r"\b(how\s+many|count\s+(them|these|those))\b", q):
+            intent.operation = "count"
+            intent.limit = None
+            intent.offset = None
+            return intent
+
+        # "only from {country}" / "filter by {country}"
+        country = _extract_country(q)
+        if country and re.search(r"\b(only|filter|from|in)\b", q):
+            intent.filters = dict(intent.filters)
+            intent.filters["country"] = country
+            return intent
+
+        # "their price" / "their prices" → price of previously referenced entities
+        if re.search(r"\b(price|prices)\b", q) and re.search(r"\b(their|those|these|them)\b", q):
+            if previous_intent.entity == "category" or previous_intent.operation == "list":
+                return QueryIntent(
+                    entity="category",
+                    operation="aggregation",
+                    is_ambiguous=True,
+                    ambiguities=[
+                        AmbiguityItem(
+                            field="category_price_aggregation",
+                            type="missing_attribute",
+                            reason="Categories do not have a direct price column. Price is stored on products.",
+                            options=[
+                                "Prices of products in each category",
+                                "Average product price per category",
+                                "Minimum and maximum product price per category",
+                            ],
+                        )
+                    ],
+                    clarification=ClarificationRequest(
+                        field_name="category_price_aggregation",
+                        question="The previous result contains categories, but price is stored for individual products. What would you like to see?",
+                        options=[
+                            "Prices of products in each category",
+                            "Average product price per category",
+                            "Minimum and maximum product price per category",
                         ],
-                        clarification=ClarificationRequest(
-                            question="The previous result contains categories, but price is stored for individual products. What would you like to see?",
-                            options=["Prices of products in each category", "Average product price per category", "Minimum and maximum product price per category"],
-                            field_name="category_price_aggregation",
-                            missing_attribute="price",
-                        ),
-                    )
+                        missing_attribute="price",
+                    ),
+                )
+            intent.primary_metric = "price"
+            intent.metrics = ["price"]
+            intent.sort_column = "price"
+            return intent
 
-                new_intent = previous_intent.model_copy(deep=True)
-                new_intent.primary_metric = "price"
-                new_intent.metrics = ["price"]
-                new_intent.sort_column = "price"
-                if previous_result_context and previous_result_context.returned_ids:
-                    new_intent.referenced_ids = previous_result_context.returned_ids
-                new_intent.is_ambiguous = False
-                new_intent.clarification = None
-                return new_intent
+        # Metric switch: "by revenue, not orders" / "by order count, not spending"
+        if re.search(r"\bnot\s+(spending|orders?|revenue)\b", q):
+            if re.search(r"\border\s+count\b|\bnumber\s+of\s+orders\b", q):
+                intent.primary_metric = "order_count"
+            elif re.search(r"\brevenue\b", q):
+                intent.primary_metric = "revenue"
+            elif re.search(r"\bspending\b|\bspent\b", q):
+                intent.primary_metric = "spending"
+            elif re.search(r"\bunits?\s+sold\b", q):
+                intent.primary_metric = "units_sold"
+            return intent
 
-            # Follow-up: "Only from India"
-            country_match = re.search(r"(?:only|filter)\s+(?:from|in)\s+([a-zA-Z\s]+)", q_lower)
-            if country_match:
-                country = country_match.group(1).strip().title()
-                new_intent = previous_intent.model_copy(deep=True)
-                new_intent.filters["country"] = country
-                new_intent.is_ambiguous = False
-                new_intent.clarification = None
-                return new_intent
+        # "revenue from them" / "revenue we get from them"
+        if re.search(r"\brevenue\b", q):
+            intent.primary_metric = "revenue"
+            intent.operation = "aggregation"
+            return intent
 
-        return previous_intent or QueryIntent(is_ambiguous=False)
+        # "i am asking total" → collapse group_by
+        if re.search(r"\b(i\s+am\s+asking\s+total|just\s+the\s+total|give\s+me\s+the\s+total)\b", q):
+            intent.group_by = None
+            intent.operation = "aggregation"
+            return intent
 
-    @staticmethod
+        # "category wise" / "per category" → group by category
+        if re.search(r"\bcategory[\s-]?wise\b|\bper\s+category\b", q):
+            intent.group_by = "category"
+            return intent
+
+        # Year filter follow-up ("and for 2024?")
+        year = _extract_year(q)
+        if year:
+            intent.time_range = year
+            return intent
+
+        # "its sales" → ambiguous metric
+        if re.search(r"\bits\s+sales\b", q):
+            intent.is_ambiguous = True
+            intent.ambiguities = [
+                AmbiguityItem(
+                    field="metric",
+                    type="metric",
+                    reason="'sales' is ambiguous.",
+                    options=["Total Revenue", "Units Sold"],
+                )
+            ]
+            intent.clarification = ClarificationRequest(
+                field_name="metric",
+                question="What do you mean by 'sales'?",
+                options=["Total Revenue", "Units Sold"],
+            )
+
+        return intent
+
+    # ------------------------------------------------------------------
+    # Clarification resolution
+    # ------------------------------------------------------------------
+
+    @classmethod
     def resolve_clarification(
+        cls,
         user_response: str,
         clarification_context: ClarificationContext,
         schema: DatabaseSchema,
     ) -> tuple[bool, Optional[QueryIntent], Optional[str], Optional[list[str]]]:
-        resp_lower = user_response.lower().strip()
-        intent = clarification_context.current_intent or QueryIntent()
-        missing_field = clarification_context.missing_field
+        resp = user_response.lower().strip()
+        intent = clarification_context.current_intent
+        field = clarification_context.missing_field
 
-        # Free-text: "highest" when asking "What price qualifies as expensive?" (TEST 4 requirement)
-        if missing_field == "price_threshold" and resp_lower == "highest":
-            return (
-                False,
-                None,
-                "I can interpret 'highest' in two ways: 1. Show the single highest-priced product. 2. Define expensive products using a high-price threshold. Which do you mean?",
-                ["Single highest-priced product", "Price > $500 threshold"],
-            )
+        # ── Price threshold clarification ────────────────────────────────
+        if field == "price_threshold":
+            # "highest" is still ambiguous
+            if resp in ("highest", "highest price", "the highest"):
+                return (
+                    False,
+                    None,
+                    "I can interpret 'highest' in two ways:\n"
+                    "1. Show the single highest-priced product.\n"
+                    "2. Define expensive as price > $500.\n"
+                    "Which do you mean?",
+                    ["Single highest-priced product", "Price > $500 threshold"],
+                )
+            # Numeric threshold
+            num_m = _NUM_RE.search(resp)
+            if "above" in resp or "over" in resp or ">" in resp or num_m:
+                val = float(num_m.group(1)) if num_m else 100.0
+                updated = intent.model_copy(deep=True)
+                updated.filters = dict(updated.filters)
+                updated.filters["price_gt"] = val
+                updated.is_ambiguous = False
+                updated.clarification = None
+                return True, updated, None, None
+            if "average" in resp:
+                updated = intent.model_copy(deep=True)
+                updated.filters = dict(updated.filters)
+                updated.filters["price_above_avg"] = True
+                updated.is_ambiguous = False
+                updated.clarification = None
+                return True, updated, None, None
+            if "10" in resp or "percent" in resp or "top 10" in resp:
+                updated = intent.model_copy(deep=True)
+                updated.filters = dict(updated.filters)
+                updated.filters["price_top_10_percent"] = True
+                updated.is_ambiguous = False
+                updated.clarification = None
+                return True, updated, None, None
+            # "single highest-priced product"
+            if "single" in resp or "highest-priced" in resp:
+                updated = intent.model_copy(deep=True)
+                updated.operation = "ranking"
+                updated.primary_metric = "price"
+                updated.sort_column = "price"
+                updated.sort_direction = "descending"
+                updated.limit = 1
+                updated.is_ambiguous = False
+                updated.clarification = None
+                return True, updated, None, None
 
-        # Free-text: "above 1000" (TEST 2 requirement)
-        num_match = re.search(r"(?:above|over|>|greater than)?\s*\$?(\d+(?:\.\d+)?)", resp_lower)
-        if missing_field == "price_threshold" and ("above" in resp_lower or ">" in resp_lower or num_match):
-            val = float(num_match.group(1)) if num_match else 1000.0
-            intent.filters["price_gt"] = val
-            intent.is_ambiguous = False
-            intent.clarification = None
-            return (True, intent, None, None)
+        # ── Category price aggregation clarification ─────────────────────
+        if field == "category_price_aggregation":
+            updated = intent.model_copy(deep=True)
+            updated.entity = "category"
+            updated.operation = "aggregation"
+            updated.is_ambiguous = False
+            updated.clarification = None
+            if "average" in resp:
+                updated.primary_metric = "avg_product_price"
+            elif "min" in resp or "max" in resp:
+                updated.primary_metric = "min_max_product_price"
+            else:
+                updated.primary_metric = "product_prices"
+            return True, updated, None, None
 
-        # Free-text: "above average" (TEST 3 requirement)
-        if missing_field == "price_threshold" and "average" in resp_lower:
-            intent.filters["price_above_avg"] = True
-            intent.is_ambiguous = False
-            intent.clarification = None
-            return (True, intent, None, None)
+        # ── Customer metric clarification ("best customer") ──────────────
+        if field == "metric":
+            updated = intent.model_copy(deep=True)
+            updated.operation = "ranking"
+            updated.sort_direction = "descending"
+            updated.limit = updated.limit or 1
+            updated.is_ambiguous = False
+            updated.clarification = None
 
-        # Free-text / Option: Top 10 percent
-        if missing_field == "price_threshold" and "10" in resp_lower:
-            intent.filters["price_top_10_percent"] = True
-            intent.is_ambiguous = False
-            intent.clarification = None
-            return (True, intent, None, None)
+            if "spending" in resp:
+                updated.entity = "customer"
+                updated.primary_metric = "spending"
+                updated.sort_column = "total_spending"
+            elif "order" in resp:
+                updated.primary_metric = "order_count"
+                updated.sort_column = "total_orders"
+            elif "unit" in resp or "purchased" in resp or "sold" in resp:
+                updated.entity = "product"
+                updated.primary_metric = "units_sold"
+                updated.sort_column = "total_units_sold"
+            elif "average" in resp and "order" in resp:
+                updated.entity = "customer"
+                updated.primary_metric = "average_order_value"
+                updated.sort_column = "average_order_value"
+            elif "revenue" in resp:
+                updated.primary_metric = "revenue"
+                updated.sort_column = "total_revenue"
+            elif "total revenue" in resp or "units sold" in resp:
+                updated.primary_metric = "units_sold" if "units" in resp else "revenue"
+            return True, updated, None, None
 
-        # Clarification for Category + Price follow-up (TEST 5 requirement)
-        if missing_field == "category_price_aggregation":
-            if "average" in resp_lower:
-                intent.entity = "category"
-                intent.operation = "aggregation"
-                intent.primary_metric = "avg_product_price"
-                intent.is_ambiguous = False
-                intent.clarification = None
-                return (True, intent, None, None)
-            if "min" in resp_lower or "max" in resp_lower:
-                intent.entity = "category"
-                intent.operation = "aggregation"
-                intent.primary_metric = "min_max_product_price"
-                intent.is_ambiguous = False
-                intent.clarification = None
-                return (True, intent, None, None)
+        # ── Time range clarification ─────────────────────────────────────
+        if field == "time_range":
+            updated = intent.model_copy(deep=True)
+            updated.is_ambiguous = False
+            updated.clarification = None
+            if "7" in resp or "week" in resp:
+                updated.time_range = "last_7_days"
+            elif "30" in resp or "month" in resp:
+                updated.time_range = "last_30_days"
+            elif "90" in resp:
+                updated.time_range = "last_90_days"
+            elif "year" in resp or "this year" in resp:
+                updated.time_range = "this_year"
+            return True, updated, None, None
 
-        # Option selection: "Highest total spending"
-        if "spending" in resp_lower:
-            intent.entity = "customer"
-            intent.operation = "ranking"
-            intent.primary_metric = "spending"
-            intent.sort_column = "total_spending"
-            intent.sort_direction = "descending"
-            intent.limit = 1
-            intent.is_ambiguous = False
-            intent.clarification = None
-            return (True, intent, None, None)
+        # Default: mark resolved
+        updated = intent.model_copy(deep=True)
+        updated.is_ambiguous = False
+        updated.clarification = None
+        return True, updated, None, None
 
-        # Option selection: "Most orders"
-        if "order" in resp_lower:
-            intent.entity = "customer" if intent.entity == "customer" else "product"
-            intent.operation = "ranking"
-            intent.primary_metric = "order_count"
-            intent.sort_column = "total_orders"
-            intent.sort_direction = "descending"
-            intent.limit = 1
-            intent.is_ambiguous = False
-            intent.clarification = None
-            return (True, intent, None, None)
 
-        # Option selection: "Units sold" / "Products purchased"
-        if "unit" in resp_lower or "purchased" in resp_lower or "sold" in resp_lower:
-            intent.entity = "product"
-            intent.operation = "ranking"
-            intent.primary_metric = "units_sold"
-            intent.sort_column = "total_units_sold"
-            intent.sort_direction = "descending"
-            intent.limit = 1
-            intent.is_ambiguous = False
-            intent.clarification = None
-            return (True, intent, None, None)
-
-        # Default fallback resolution
-        intent.is_ambiguous = False
-        intent.clarification = None
-        return (True, intent, None, None)
-
+# ---------------------------------------------------------------------------
+# HeuristicAIProvider — full LLMProvider implementation
+# ---------------------------------------------------------------------------
 
 class HeuristicAIProvider(LLMProvider):
-    """Deterministic Heuristic Engine implementing full LLMProvider interface."""
+    """Deterministic Heuristic Engine implementing full LLMProvider interface.
+
+    Used in offline/test mode. All results are deterministic and schema-driven.
+    No API calls made.
+    """
 
     def get_provider_name(self) -> str:
         return "Deterministic Heuristic Engine"
@@ -565,6 +743,7 @@ class HeuristicAIProvider(LLMProvider):
         query: str,
         previous_result_context: Optional[ResultContext] = None,
     ) -> QueryIntent:
+        # Heuristic: ambiguity already injected during analyze_intent
         return intent
 
     async def resolve_clarification(
@@ -573,9 +752,9 @@ class HeuristicAIProvider(LLMProvider):
         clarification_context: ClarificationContext,
         schema: DatabaseSchema,
     ) -> tuple[bool, Optional[QueryIntent], Optional[str], Optional[dict[str, Any]]]:
-        res, intent, q, opts = QueryAnalyzer.resolve_clarification(
+        resolved, updated_intent, follow_up_q, follow_up_opts = QueryAnalyzer.resolve_clarification(
             user_response=user_response,
             clarification_context=clarification_context,
             schema=schema,
         )
-        return res, intent, q, opts
+        return resolved, updated_intent, follow_up_q, follow_up_opts
