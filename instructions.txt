@@ -1,0 +1,1516 @@
+AI SQL Analyst
+1. Product Overview
+Product name
+
+QueryPilot — AI-powered natural-language database analyst.
+
+One-line description
+
+A conversational AI application that allows users to query relational databases using natural language, automatically understands database schemas, detects ambiguity in user requests, asks targeted clarification questions when necessary, generates safe SQL, executes it, and explains the results.
+
+Core principle
+
+The application must not behave as a simple:
+
+English → SQL
+
+translator.
+
+Instead:
+
+Natural Language
+       ↓
+Intent Understanding
+       ↓
+Schema Retrieval
+       ↓
+Ambiguity Detection
+       ↓
+ ┌───────────────┐
+ │               │
+Ambiguous       Clear
+ │               │
+ ▼               ▼
+Clarification   SQL Generation
+ │               │
+ └───────┬───────┘
+         ▼
+    SQL Validation
+         ↓
+    Safe Execution
+         ↓
+   Result Analysis
+         ↓
+   Natural Language
+      Response
+2. Problem Statement
+
+Many users need to extract information from databases but do not know SQL.
+
+Traditional database interfaces require users to understand:
+
+tables
+columns
+joins
+aggregation
+filtering
+grouping
+SQL syntax
+
+LLM-based text-to-SQL systems solve part of this problem, but naïvely converting natural language directly into SQL creates another problem:
+
+Natural language is often ambiguous.
+
+For example:
+
+"Find the best customer."
+
+Possible interpretations include:
+
+highest total spending
+most orders
+most products purchased
+highest average order value
+most recent activity
+
+The system must not guess silently.
+
+It should identify the ambiguity and ask the user to clarify.
+
+3. Goals
+Primary goals
+
+The application must:
+
+Allow users to query databases using natural language.
+Automatically discover database schemas.
+Support a built-in sample e-commerce database.
+Support user-provided databases.
+Detect ambiguous natural-language queries.
+Ask targeted clarification questions.
+Generate SQL only after sufficient intent is known.
+Validate generated SQL before execution.
+Restrict execution to safe read-only operations.
+Execute queries against the appropriate database.
+Explain results in natural language.
+Maintain conversational context.
+Support follow-up questions.
+Be deployable as a public web application.
+Have a clear separation between frontend, backend, AI orchestration and database execution.
+4. Non-Goals
+
+The first version should not attempt to:
+
+support every database engine
+modify production databases
+execute arbitrary INSERT, UPDATE, DELETE, DROP, etc.
+automatically expose local databases to the internet
+train a custom LLM
+build a full BI dashboard platform
+replace database administrators
+guarantee semantic understanding of every possible business term
+5. Target Users
+User type 1 — Non-technical user
+
+Someone who wants to ask:
+
+"Which product sold the most last month?"
+
+without knowing SQL.
+
+User type 2 — Developer
+
+Someone who wants to quickly inspect a database using natural language.
+
+User type 3 — Student / learner
+
+Someone who wants to understand:
+
+Natural language
+        ↓
+SQL
+        ↓
+Result
+User type 4 — Portfolio/demo visitor
+
+Someone who opens the deployed website and immediately tries the sample database.
+
+6. Database Connection Modes
+
+The application must provide three modes.
+
+Mode A — Built-in Sample Database
+
+This should be the default mode.
+
+User clicks:
+
+Try Sample Database
+
+The application connects to a preconfigured read-only e-commerce database.
+
+Example schema:
+
+customers
+├── id
+├── name
+├── email
+├── country
+└── created_at
+
+orders
+├── id
+├── customer_id
+├── order_date
+├── status
+└── total_amount
+
+order_items
+├── id
+├── order_id
+├── product_id
+└── quantity
+
+products
+├── id
+├── name
+├── category_id
+├── price
+└── stock_quantity
+
+categories
+├── id
+└── name
+
+Relationships:
+
+customers
+    │
+    │ 1:N
+    ▼
+orders
+    │
+    │ 1:N
+    ▼
+order_items
+    │
+    │ N:1
+    ▼
+products
+    │
+    │ N:1
+    ▼
+categories
+
+The sample database should contain enough realistic data to make queries interesting.
+
+Recommended:
+
+1,000+ customers
+5,000+ orders
+10,000+ order items
+500+ products
+20+ categories
+
+The exact numbers can be adjusted depending on deployment limits.
+
+7. Mode B — Upload Database
+
+Initially support:
+
+SQLite
+
+User can upload:
+
+database.db
+
+The backend should:
+
+receive the file
+validate it
+inspect its schema
+create a temporary isolated database/session
+expose it to the SQL agent
+delete it when the session expires
+
+The user should see:
+
+Database uploaded successfully.
+
+Tables discovered:
+12
+
+Relationships:
+15
+
+Ready to query.
+Security requirements
+
+Uploaded databases must:
+
+never be executed as code
+have file-size limits
+have session isolation
+have automatic expiration
+be stored temporarily
+never become publicly accessible
+8. Mode C — Connect Remote PostgreSQL Database
+
+Allow users to connect an externally accessible PostgreSQL database.
+
+Connection form:
+
+Database Type
+
+PostgreSQL
+
+Host
+Port
+Database
+Username
+Password
+SSL
+
+Example:
+
+Host: db.example.com
+Port: 5432
+Database: ecommerce
+Username: ai_readonly
+Password: ********
+SSL: Required
+
+The system must strongly recommend a read-only database user.
+
+The application should never require administrative credentials.
+
+9. Future Database Support
+
+Architecture should make additional adapters possible:
+
+DatabaseAdapter
+    │
+    ├── PostgreSQLAdapter
+    ├── SQLiteAdapter
+    ├── MySQLAdapter
+    └── Future adapters
+
+Do not implement MySQL in the first release unless it is trivial.
+
+10. Schema Introspection
+
+After connecting to a database:
+
+Database
+    ↓
+Schema Introspector
+    ↓
+Tables
+Columns
+Types
+Primary Keys
+Foreign Keys
+Indexes
+Relationships
+
+The backend should build a structured schema representation.
+
+Example:
+
+{
+  "table": "orders",
+  "columns": [
+    {
+      "name": "customer_id",
+      "type": "integer"
+    },
+    {
+      "name": "total_amount",
+      "type": "numeric"
+    }
+  ],
+  "foreign_keys": [
+    {
+      "column": "customer_id",
+      "references": "customers.id"
+    }
+  ]
+}
+11. Schema Knowledge Layer
+
+Do not send the complete database contents to the LLM.
+
+The LLM should receive:
+
+Schema metadata
++
+Relevant tables
++
+Relevant relationships
++
+Business definitions
+
+It should never receive the entire database simply to answer a query.
+
+For large schemas:
+
+User Query
+    ↓
+Schema Retrieval
+    ↓
+Relevant tables
+    ↓
+LLM
+
+Example:
+
+User:
+
+"Who spent the most?"
+
+Relevant schema:
+
+customers
+orders
+
+No need to provide unrelated tables such as:
+
+employees
+suppliers
+warehouse_locations
+audit_logs
+12. Business Semantic Layer
+
+Support optional descriptions for tables and columns.
+
+Example:
+
+orders.total_amount:
+  description: Final amount paid by the customer
+
+orders.status:
+  completed: Successfully fulfilled order
+  cancelled: Cancelled before fulfilment
+
+revenue:
+  definition: Sum of completed order amounts
+
+This is important because database schemas alone don't always encode business meaning.
+
+13. Natural Language Query Pipeline
+
+Every user query must go through this pipeline:
+
+User Query
+    ↓
+Conversation Context
+    ↓
+Intent Extraction
+    ↓
+Schema Retrieval
+    ↓
+Ambiguity Detection
+    ↓
+Clarification OR SQL Generation
+    ↓
+SQL Validation
+    ↓
+SQL Execution
+    ↓
+Result Processing
+    ↓
+Natural Language Explanation
+14. Intent Representation
+
+The LLM should first generate a structured intent representation.
+
+Example:
+
+User:
+
+"Find the best customer."
+
+Internal representation:
+
+{
+  "entity": "customer",
+  "operation": "ranking",
+  "metric": null,
+  "time_range": null,
+  "limit": 1,
+  "sort_direction": "descending",
+  "ambiguities": [
+    {
+      "field": "metric",
+      "reason": "The word 'best' has multiple possible meanings."
+    }
+  ]
+}
+
+The application should not generate SQL yet.
+
+15. Ambiguity Detection
+
+This is a core feature.
+
+The system must identify ambiguity in:
+
+Metrics
+
+"best customer"
+
+Possible meanings:
+
+highest spending
+most orders
+most products purchased
+highest average order value
+Time
+
+"sales this year"
+
+Potential meanings:
+
+calendar year
+financial year
+last 12 months
+Entity
+
+"Apple sales"
+
+Could refer to:
+
+Apple company
+Apple product
+Apple brand
+Aggregation
+
+"average customer spending"
+
+Could mean:
+
+average total spending per customer
+
+versus other interpretations.
+
+Threshold
+
+"expensive products"
+
+What qualifies as expensive?
+
+price > ₹10,000
+price > average price
+top 10%
+Business terminology
+
+"revenue"
+
+Could require the database owner's definition.
+
+16. Clarification Engine
+
+When ambiguity exists, the application must not guess.
+
+Instead it should generate a concise clarification.
+
+Example:
+
+What do you mean by "best customer"?
+
+1. Highest total spending
+2. Most orders placed
+3. Most products purchased
+4. Highest average order value
+
+The frontend should render these as clickable options.
+
+[ Highest spending ]
+[ Most orders ]
+[ Most products ]
+[ Average order value ]
+
+The user can also provide their own interpretation.
+
+17. Clarification Rules
+
+The clarification engine should:
+
+ask only when ambiguity materially changes the SQL/result
+avoid unnecessary questions
+group related ambiguities where possible
+provide concrete options
+allow free-text responses
+remember previous answers
+never silently choose a potentially different interpretation
+
+Bad:
+
+Please clarify.
+
+Good:
+
+When you say "best customer", should I rank customers by total spending, number of orders, or number of products purchased?
+
+18. Multi-Turn Conversation
+
+The application must maintain conversation state.
+
+Example:
+
+User:
+Find the best customer.
+
+AI:
+Best based on what?
+
+User:
+Total spending.
+
+AI:
+For which period?
+
+User:
+This year.
+
+AI:
+[Result]
+
+Then:
+
+User:
+What about the second one?
+
+The system should understand:
+
+same metric
+same time period
+same entity
+rank = 2
+
+It should not start from scratch.
+
+19. Follow-Up Queries
+
+Support contextual queries:
+
+Show the top 5 customers by spending.
+
+Only from India.
+
+Now show their average order value.
+
+What about last year?
+
+Show the second highest.
+
+The system should modify the previous query intent rather than regenerate context blindly.
+
+20. SQL Generation
+
+Only generate SQL after intent is sufficiently specified.
+
+Example:
+
+SELECT
+    c.id,
+    c.name,
+    SUM(o.total_amount) AS total_spending
+FROM customers c
+JOIN orders o
+    ON c.id = o.customer_id
+WHERE o.status = 'completed'
+GROUP BY c.id, c.name
+ORDER BY total_spending DESC
+LIMIT 1;
+
+The generated SQL must be based on the actual discovered schema.
+
+Never assume table/column names.
+
+21. SQL Validation
+
+Before execution, run SQL through a validation layer.
+
+Validate:
+
+Syntax
+
+Is it valid SQL for the selected database engine?
+
+Schema
+
+Do tables exist?
+
+Do columns exist?
+
+Permissions
+
+Does the connected user have access?
+
+Safety
+
+Reject:
+
+DROP
+DELETE
+UPDATE
+INSERT
+ALTER
+TRUNCATE
+CREATE
+GRANT
+REVOKE
+
+For V1, allow only:
+
+SELECT
+WITH
+
+Potentially allow:
+
+EXPLAIN
+
+under controlled conditions.
+
+22. Query Cost Protection
+
+Prevent expensive accidental queries.
+
+Implement:
+
+maximum execution time
+maximum returned rows
+query timeout
+pagination
+result-size limit
+
+For example:
+
+Maximum execution time: 10 seconds
+Maximum rows: 1,000
+
+The application should not allow:
+
+SELECT *
+FROM huge_table;
+
+to return millions of rows.
+
+23. Query Execution
+
+After validation:
+
+Validated SQL
+     ↓
+Database Adapter
+     ↓
+Database
+     ↓
+Result
+
+The frontend should display:
+
+Query completed in 420 ms
+
+127 rows returned
+24. Result Presentation
+
+Don't simply dump a JSON response.
+
+Show:
+
+Summary
+
+There were 127 completed orders this month, generating ₹8.4 lakh in revenue.
+
+Table
+Customer          Orders    Spending
+------------------------------------
+Rahul Sharma      27        ₹1,42,350
+Priya Kumar       24        ₹1,31,200
+...
+SQL
+
+Provide an expandable section:
+
+▼ View generated SQL
+25. Result Explanation
+
+The LLM may explain the result, but it must not invent facts.
+
+The explanation should be generated strictly from:
+
+SQL
++
+Returned result
++
+Known schema/business definitions
+26. Frontend
+
+Use:
+
+React
+TypeScript
+Vite
+Tailwind CSS
+
+Recommended layout:
+
+┌──────────────────────────────────────────────┐
+│ QueryPilot                         Database ●│
+├───────────────┬──────────────────────────────┤
+│               │                              │
+│ Database      │       Conversation           │
+│               │                              │
+│ ● Sample DB   │ User:                       │
+│ ○ Upload DB   │ Find the best customer      │
+│ ○ PostgreSQL  │                              │
+│               │ AI:                          │
+│               │ What does "best" mean?      │
+│ Schema        │                              │
+│               │ [Highest spending]           │
+│ customers     │ [Most orders]                │
+│ orders        │ [Most products]              │
+│ products      │                              │
+│ categories    │                              │
+│               │                              │
+│               │ ┌──────────────────────────┐ │
+│               │ │ Ask a question...       │ │
+│               │ └──────────────────────────┘ │
+└───────────────┴──────────────────────────────┘
+27. Sample Database Experience
+
+When the user selects the sample database, display:
+
+Sample E-Commerce Database
+
+Tables
+────────────
+customers
+orders
+order_items
+products
+categories
+
+Relationships
+────────────
+customers → orders
+orders → order_items
+order_items → products
+products → categories
+
+Provide example prompts:
+
+Try asking:
+
+• Who are our top 5 customers?
+• Which products sold the most?
+• What was our revenue last month?
+• Which category generates the most revenue?
+• Find customers who haven't ordered recently.
+• What's the average order value?
+28. Database Connection Security
+
+Never store raw database passwords in plaintext.
+
+For V1:
+
+keep credentials only for the active session
+use encrypted transport
+do not log credentials
+redact credentials from errors
+use connection pooling carefully
+disconnect idle sessions
+
+For production architecture, credentials should be encrypted at rest if persistent connections are supported.
+
+29. Important Localhost Limitation
+
+If a user chooses:
+
+PostgreSQL
+Host: localhost
+Port: 5432
+
+from the public website, that means:
+
+User's browser
+localhost
+
+not your backend server.
+
+Therefore a deployed backend cannot directly access the user's local PostgreSQL database.
+
+The product must clearly explain:
+
+Local databases cannot be accessed directly by the cloud application. Use the SQLite upload option, connect a publicly reachable PostgreSQL database, or run the application locally.
+
+Do not attempt to bypass this restriction.
+
+30. Deployment Architecture
+
+The application should be deployable.
+
+Recommended architecture:
+
+                     Internet
+                        │
+                        ▼
+                 ┌─────────────┐
+                 │   Vercel    │
+                 │   Frontend  │
+                 └──────┬──────┘
+                        │ HTTPS
+                        ▼
+                 ┌─────────────┐
+                 │  FastAPI    │
+                 │   Backend   │
+                 └──────┬──────┘
+                        │
+             ┌──────────┼──────────┐
+             ▼          ▼          ▼
+          Sample     SQLite     Remote
+             DB       Upload     PostgreSQL
+
+Use free-tier services where practical.
+
+The application must work using the provider's free subdomain.
+
+Example:
+
+https://querypilot.vercel.app
+
+No custom domain should be required.
+
+31. API Design
+
+Suggested endpoints:
+
+POST /api/database/sample
+POST /api/database/upload
+POST /api/database/connect
+
+GET  /api/database/{id}/schema
+
+POST /api/chat
+POST /api/chat/{conversation_id}/clarify
+
+POST /api/query/validate
+POST /api/query/execute
+
+GET  /api/conversations/{id}
+DELETE /api/session/{id}
+
+The exact API design can be adjusted by the implementation agent.
+
+32. AI Agent Architecture
+
+Do not create one giant prompt.
+
+Separate responsibilities.
+
+                    User Query
+                        │
+                        ▼
+                 Intent Analyzer
+                        │
+                        ▼
+                Schema Retriever
+                        │
+                        ▼
+              Ambiguity Detector
+                   │         │
+              ambiguous    clear
+                   │         │
+                   ▼         ▼
+             Clarification  SQL Generator
+                              │
+                              ▼
+                        SQL Validator
+                              │
+                              ▼
+                        SQL Executor
+                              │
+                              ▼
+                       Result Analyzer
+
+This modularity is important for debugging and evaluation.
+
+33. LLM Structured Outputs
+
+All AI components should preferably return structured JSON rather than free-form text.
+
+For example:
+
+{
+  "status": "ambiguous",
+  "intent": {
+    "entity": "customer",
+    "operation": "ranking"
+  },
+  "clarification": {
+    "question": "What should 'best' mean?",
+    "options": [
+      "Highest total spending",
+      "Most orders",
+      "Most products purchased"
+    ]
+  }
+}
+
+This makes the application deterministic enough for a production-style backend.
+
+34. Error Handling
+
+The system must handle:
+
+Invalid SQL
+I couldn't generate a valid query for this request.
+Unknown table
+I couldn't find a table representing "subscriptions".
+Database unavailable
+The database connection is currently unavailable.
+Permission denied
+The connected database user doesn't have permission to access this table.
+Ambiguous query
+
+Ask clarification.
+
+No results
+The query executed successfully, but no matching records were found.
+35. Observability
+
+Log:
+
+conversation_id
+query_id
+database_type
+intent
+ambiguity_detected
+clarification_count
+SQL_generation_time
+SQL_execution_time
+rows_returned
+errors
+
+Never log:
+
+database passwords
+connection strings containing passwords
+private credentials
+36. Evaluation Framework
+
+Create a benchmark dataset.
+
+Example:
+
+100–300 natural-language queries
+
+Categories:
+
+Simple
+Ambiguous
+Multi-turn
+Aggregation
+Joins
+Filtering
+Time-based
+Ranking
+Nested queries
+Business terminology
+
+Evaluate:
+
+Intent accuracy
+
+Did the system understand the user's intention?
+
+Ambiguity detection
+
+Did it identify ambiguous queries?
+
+Clarification accuracy
+
+Did it ask the right question?
+
+SQL execution accuracy
+
+Did generated SQL return the intended result?
+
+Safety
+
+Did it reject dangerous queries?
+
+Follow-up accuracy
+
+Did it preserve conversation context?
+
+37. Example Benchmark
+
+Input:
+
+Find the best customer.
+
+Expected:
+
+AMBIGUOUS
+
+Input:
+
+Find the customer with the highest total spending in 2026.
+
+Expected:
+
+CLEAR
+
+Input:
+
+Show customers who haven't ordered recently.
+
+Expected:
+
+AMBIGUOUS
+
+Possible clarification:
+
+How recent should "recently" mean?
+
+7 days
+30 days
+90 days
+Custom period
+
+Input:
+
+Show the top 5 customers by completed-order revenue in 2026.
+
+Expected:
+
+CLEAR
+38. UX Principle
+
+The AI should ask the minimum number of questions necessary.
+
+Bad:
+
+Which customer?
+Which year?
+Which country?
+Which metric?
+Which order status?
+
+when many defaults are obvious.
+
+Good:
+
+What does "best" mean?
+
+1. Highest spending
+2. Most orders
+3. Most products purchased
+
+Then infer everything else from the query.
+
+39. Example End-to-End Conversation
+User
+
+Find the best customer.
+
+AI
+
+"Best customer" could mean several things. Which should I use?
+
+[Highest total spending]
+[Most orders]
+[Most products purchased]
+[Highest average order value]
+User
+
+Highest total spending.
+
+AI
+
+What time period should I consider?
+
+[All time]
+[This year]
+[Last 12 months]
+[Custom]
+User
+
+This year.
+
+AI
+Interpretation
+
+Entity: Customer
+Metric: Total spending
+Period: 2026
+Order status: Completed
+
+SQL:
+SELECT ...
+
+Result:
+
+Rahul Sharma
+₹1,42,350
+User
+
+What about the second one?
+
+AI understands:
+
+same metric
+same period
+rank = 2
+
+and executes the appropriate query.
+
+40. Technology Stack
+Frontend
+React
+TypeScript
+Vite
+Tailwind CSS
+Backend
+Python
+FastAPI
+Pydantic
+SQLAlchemy
+Databases
+PostgreSQL
+SQLite
+AI
+
+Use an LLM provider through an abstraction:
+
+LLMProvider
+    │
+    ├── Gemini
+    ├── OpenAI-compatible API
+    └── Future providers
+
+Do not tightly couple the entire application to one LLM provider.
+
+Deployment
+
+Frontend:
+
+Vercel
+
+Backend:
+
+Any suitable free-tier container/Python host
+
+Database:
+
+PostgreSQL-compatible free-tier provider
+41. Project Structure
+
+Suggested:
+
+querypilot/
+│
+├── frontend/
+│   ├── src/
+│   │   ├── components/
+│   │   ├── pages/
+│   │   ├── hooks/
+│   │   ├── services/
+│   │   ├── types/
+│   │   └── utils/
+│   └── ...
+│
+├── backend/
+│   ├── app/
+│   │   ├── api/
+│   │   ├── core/
+│   │   ├── models/
+│   │   ├── services/
+│   │   │   ├── ai/
+│   │   │   ├── database/
+│   │   │   ├── schema/
+│   │   │   ├── ambiguity/
+│   │   │   └── sql/
+│   │   ├── adapters/
+│   │   │   ├── postgres.py
+│   │   │   └── sqlite.py
+│   │   └── main.py
+│   │
+│   └── tests/
+│
+├── sample_database/
+│   ├── schema.sql
+│   ├── seed.sql
+│   └── README.md
+│
+├── docs/
+│   ├── architecture.md
+│   └── evaluation.md
+│
+├── docker-compose.yml
+├── README.md
+└── .env.example
+42. Development Phases
+Phase 1 — Foundation
+
+Build:
+
+FastAPI backend
+React frontend
+PostgreSQL connection
+SQLite adapter
+sample database
+schema introspection
+Phase 2 — Basic Text-to-SQL
+
+Implement:
+
+Natural language
+→ schema
+→ SQL
+→ validation
+→ execution
+Phase 3 — Ambiguity Engine
+
+Implement:
+
+Intent extraction
+→ ambiguity detection
+→ clarification
+
+This is a critical milestone.
+
+Phase 4 — Conversational Context
+
+Implement:
+
+conversation state
+clarification state
+follow-up queries
+references such as "them", "those customers", "second one"
+Phase 5 — Security
+
+Implement:
+
+read-only SQL
+query timeout
+row limits
+upload limits
+credential protection
+SQL validation
+session isolation
+Phase 6 — Production UX
+
+Implement:
+
+database connection UI
+schema explorer
+SQL viewer
+result tables
+loading states
+errors
+example queries
+query history
+Phase 7 — Deployment
+
+Deploy:
+
+Frontend
+Backend
+Sample DB
+
+Then test the complete application from a fresh browser.
+
+43. Definition of Done
+
+The project is complete when a new user can:
+
+Without knowing SQL
+
+Open:
+
+https://<your-app>.vercel.app
+
+Select:
+
+Try Sample Database
+
+Ask:
+
+"Who are our best customers?"
+
+The application should detect ambiguity, ask what "best" means, receive the user's clarification, generate valid SQL, execute it, and explain the result.
+
+The user should then be able to ask:
+
+"What about the second one?"
+
+and receive the correct contextual result.
+
+A second user should be able to upload a supported SQLite database and perform the same workflow.
+
+A third user with a remote PostgreSQL database should be able to connect using a read-only account.
+
+44. Critical Acceptance Tests
+
+Antigravity should not consider the project complete until these work.
+
+Test 1 — Simple query
+How many customers are there?
+
+→ SQL → execution → result.
+
+Test 2 — Join
+Which customer spent the most?
+
+→ customers + orders.
+
+Test 3 — Ambiguity
+Who is the best customer?
+
+→ must ask clarification.
+
+Test 4 — Time ambiguity
+Show recent customers.
+
+→ must ask what "recent" means.
+
+Test 5 — Dangerous query
+Delete all customers.
+
+→ reject.
+
+Test 6 — Follow-up
+Show top 5 customers by spending.
+
+Only from India.
+
+What about the second one?
+
+→ maintain context.
+
+Test 7 — Unknown entity
+Show our most profitable suppliers.
+
+If supplier/profit isn't represented in the schema:
+
+→ explain that the required data cannot be found rather than hallucinating tables.
+
+Test 8 — Sample database
+
+A fresh user should be able to use the product without entering credentials.
+
+Test 9 — SQLite
+
+Upload .db → schema discovered → query works.
+
+Test 10 — Remote PostgreSQL
+
+Valid read-only PostgreSQL credentials → schema discovered → query works.
+
+45. Instructions to Antigravity CLI
+
+Give the coding agent the PRD above, but add this implementation directive at the beginning:
+
+You are building a production-quality portfolio project called QueryPilot.
+
+Do NOT implement this as a simple text-to-SQL chatbot.
+
+The central feature is ambiguity-aware natural-language database querying.
+
+The complete pipeline must be:
+
+Natural Language
+→ Intent Extraction
+→ Schema Retrieval
+→ Ambiguity Detection
+→ Clarification when necessary
+→ SQL Generation
+→ SQL Validation
+→ Safe Execution
+→ Result Explanation
+
+Implement the project incrementally.
+
+Before writing large amounts of code:
+1. Inspect the repository.
+2. Create the architecture.
+3. Create the database abstraction layer.
+4. Create the sample e-commerce database.
+5. Implement schema introspection.
+6. Implement the basic query pipeline.
+7. Implement ambiguity detection.
+8. Implement conversational clarification.
+9. Implement SQL safety.
+10. Implement frontend UX.
+11. Add automated tests.
+12. Prepare Docker/deployment configuration.
+
+Do not skip tests.
+
+Do not hardcode the sample database schema into the AI prompts.
+The AI must receive schema information generated from actual schema introspection.
+
+Do not assume table or column names.
+
+Do not allow destructive SQL.
+
+Do not silently resolve material ambiguities.
+
+If the user's request has multiple materially different interpretations, ask a clarification question and provide concrete options.
+
+The sample database must work without user credentials.
+
+The application must support:
+- built-in sample PostgreSQL database
+- SQLite database upload
+- remote PostgreSQL connection
+
+Design database access through adapters so additional database engines can be added later.
+
+Keep LLM logic provider-independent through an LLM abstraction.
+
+Use structured JSON/Pydantic models between AI pipeline stages.
+
+Never log passwords or credentials.
+
+The final application must be deployable and runnable locally through Docker Compose.
+
+Create comprehensive README documentation explaining:
+- architecture
+- setup
+- environment variables
+- database connection modes
+- security model
+- AI pipeline
+- ambiguity handling
+- deployment
+- testing
+One architectural decision I would insist on
+
+Don't let the LLM directly execute SQL:
+
+❌ User → LLM → Database
+
+Use:
+
+✅ User
+   ↓
+Intent
+   ↓
+Schema
+   ↓
+LLM
+   ↓
+SQL
+   ↓
+Validator
+   ↓
+Safety checks
+   ↓
+Database
+
+That distinction is important because the interesting engineering problem in this project isn't generating SQL; it's building a reliable system around an LLM that knows when it doesn't have enough information to generate the right SQL.

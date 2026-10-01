@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_NAME=QueryPilot
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - LLM_PROVIDER=heuristic
+      - SAMPLE_DB_PATH=/app/sample_database/ecommerce.db
+      - CORS_ORIGINS=["http://localhost:3000","http://localhost:80"]
+    volumes:
+      - ./sample_database:/app/sample_database:ro
+      - ./backend/temp_uploads:/app/temp_uploads
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend

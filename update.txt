@@ -1,0 +1,144 @@
+# ANTIGRAVITY PROMPT: Build a robust conversational, context-aware text-to-SQL engine (QueryPilot)
+
+You are working on **QueryPilot**, a natural-language database query app. Users connect a database (built-in sample e-commerce DB, uploaded SQLite file, or remote PostgreSQL) and ask questions in plain English. The product goal is an **AI database analyst** that understands what the user means, including ambiguity and how each message relates to earlier ones. It must NOT be a pipeline of `English -> LLM -> guessed SQL -> execute`.
+
+The app currently fails mostly on **conversation context**: follow-ups are treated as new queries, pronouns resolve to nothing, previous SQL leaks into unrelated questions, and explicit user metrics get replaced by defaults. Fix this at the architecture level.
+
+## 0. Ground rules (read first)
+
+1. **No hardcoded fixes.** Do not add phrase checks, keyword tables, or special cases such as `if "their price" in q`, `if "best customer" in q`, or `if "i am asking total" in q`. Every example in this prompt is a **regression test**, not a rule. If your fix would only work for the exact wording of an example, it is wrong.
+2. **The LLM proposes, deterministic code disposes.** The LLM may propose classification, intent, references, plans and SQL. Deterministic code must validate schema, relationships, types, scope, aggregation grain, SQL safety and result shape.
+3. **Never use raw previous SQL as memory.** Memory is structured semantic state (see section 3). Never replay, append to, or "patch" the previous SQL string.
+4. **Never silently change the user's request.** If unsure, clarify. If the schema cannot answer, say so. Never invent tables or columns.
+5. **Preserve what already works** (sample DB, SQLite upload, PostgreSQL, safety checks, existing UI). Refactor only where needed.
+
+## 1. Phase 1: Inspect and reproduce (do this before writing new code)
+
+1. Read the whole repository. Write a short architecture summary: entry points, LLM calls, prompt construction, how history is passed, where SQL is generated and executed, how the frontend stores state.
+2. Reproduce each failure in section 9 **as a failing automated test first** (conversation replay against the sample DB). Record the current wrong output for each.
+3. Write a root-cause list (for example: full chat history or last SQL dumped into one prompt; no structured result memory; no turn classification; explicit metric overridden by default; scope not tracked). Fix root causes, not symptoms.
+4. Inspect the **actual** schema. Do not assume table or column names. The sample DB likely has `customers, orders, order_items, products, categories`, but verify.
+
+## 2. Target pipeline
+
+```
+User message
+ -> Turn classification (uses conversation state)
+ -> Semantic intent extraction (structured)
+ -> Reference/entity resolution (against Result Context)
+ -> Context inheritance decision (INHERIT / MODIFY / REMOVE / RESET per field)
+ -> Schema + semantic-metadata retrieval (only relevant tables/columns/grain)
+ -> Ambiguity / completeness detection -> clarification state (if needed)
+ -> Logical query plan
+ -> Plan validation (schema, grain, scope)
+ -> SQL compilation
+ -> SQL safety + semantic validation (SQL vs plan)
+ -> Execution (timeout, row limit)
+ -> Result validation (shape vs plan)
+ -> Result Context storage
+ -> Natural-language answer + table
+```
+
+Keep each stage a separate module with typed input/output (Pydantic models / JSON schema structured output). No single giant prompt. Suggested LLM functions: `classify_turn`, `extract_intent`, `resolve_references`, `detect_ambiguity`, `resolve_clarification`, `create_logical_plan`, `generate_sql`, `explain_result`.
+
+The database layer sits behind a `DatabaseAdapter` interface (`SampleDatabaseAdapter`, `SQLiteAdapter`, `PostgreSQLAdapter`). The semantic engine must not know which one is active.
+
+## 3. Four separate memories (do not mix them)
+
+- **Conversation memory**: what was said (messages, turn types).
+- **Semantic query state**: the resolved intent/plan of the current and previous turns.
+- **Result Context**: what the last result actually contained. Store structured, not as rendered table text:
+  `query_id, intent, entity_type, entity_ids, entity_names, result_columns, result_rows (bounded), filters, metrics, dimensions, ordering, ranking, time_range, scope, source_plan`.
+  Example: after "highest priced product" returns product 186, store `entity_type=product, entity_ids=[186]`. Then "its sales" can bind `its -> product 186` without reading the UI table.
+- **Database context**: active connection, schema, grain metadata, business definitions.
+
+Keep a short stack of recent Result Contexts (not only the last one) so multi-hop chains work.
+
+## 4. Turn classification (core of follow-up understanding)
+
+Classify every message with structured LLM output using: current message, previous semantic intent, previous Result Context, pending clarification state, and schema. Do **not** classify by keyword.
+
+Classes: `NEW_QUERY`, `FOLLOW_UP`, `QUERY_REFINEMENT`, `CORRECTION`, `CLARIFICATION_RESPONSE`, `RESULT_REFERENCE`, `RESULT_EXPLANATION`, `COMPARISON_WITH_PREVIOUS_RESULT`, `CONTEXT_SWITCH`, `UNRELATED_QUERY`.
+
+Output must include: class, confidence, which previous turn(s) it relates to, and a one-line rationale (for logs only, never shown as chain-of-thought). A pending clarification takes priority: if the previous turn asked a question, first test whether this message answers it.
+
+## 5. Context inheritance (the key relation between queries)
+
+Never copy previous context wholesale. For **each field** of the previous intent (entity, metric, aggregation, filters, group_by, ordering, limit, time_range, scope, selected entity IDs), decide:
+
+- **INHERIT**: still applies (e.g. the 10 selected customer IDs, a country filter)
+- **MODIFY**: replaced by the new request (e.g. metric changes from order count to revenue; operation changes to COUNT)
+- **REMOVE**: explicitly dropped by the user
+- **RESET**: irrelevant because the topic changed
+
+Rules:
+- User corrections ("I meant revenue, not profit", "make that top 5", "not this year, last year", "products, not categories") override old values.
+- A context switch ("forget that", "now let's look at products", or simply an unrelated entity) resets irrelevant filters and entities.
+- Metrics from a previous turn must not leak into a new ranking question (an earlier "most popular" must not leave `units_sold` behind when the user later asks for the highest priced item).
+- Log the per-field decisions in a debug trace so failures are diagnosable.
+
+## 6. Reference and scope resolution
+
+Support `it, its, they, them, their, those, these, her, his, the first/second one, that category, the previous result`, and multi-hop chains (product -> its category -> that category's revenue).
+
+Resolve against the Result Context by entity type, IDs, names and position. If the referent is unavailable or several plausible referents change the answer, ask a targeted clarification. If a reference points at the wrong entity type for the requested attribute (previous result was categories, user asks about "their price" and price lives on products), detect the mismatch and either traverse the relationship (category -> products) or clarify. Never fall back to replaying the old query.
+
+Track **scope** explicitly on every plan: `GLOBAL`, `PREVIOUS_RESULT_SET`, `SINGLE_PREVIOUS_ENTITY`. "total revenue" is global; "revenue from them" is per the previous set; "her revenue" is one entity; "give me the total" after a per-customer table means combine the **current scope**, not the whole database. A plan with a referenced scope but no scope filter in the SQL must fail validation.
+
+## 7. Ambiguity detection and clarification
+
+Detect ambiguity in metric, entity, time range, aggregation, scope, filter thresholds, reference, and business definition ("best", "popular", "recent", "expensive", "sales"). Skip clarification when the user was explicit or the business-definition layer defines the term. **Explicit user metrics always win** (never replace "number of orders" with spending).
+
+When clarifying, store: `original_query, current_intent, missing_fields, question, options, expected_answer_type, schema_context`. Pass all of it to the resolver with the user's reply. The reply may be a button choice **or free text** ("above 1000", "above average", "top 10 percent", "last ordered"). If a reply does not actually resolve the missing field (for example "highest" for a price threshold), ask a narrower follow-up instead of guessing.
+
+Clarifications must be specific ("What should 'best customer' mean?" with concrete options), never "please clarify".
+
+## 8. Planning, grain safety, validation
+
+- The SQL generator receives only the **resolved logical plan + relevant schema + semantic metadata**. It must not re-interpret the raw user text.
+- Build table-grain and join-cardinality metadata dynamically (orders: one row per order; order_items: one row per order line; etc.). Reject or rewrite plans where a join multiplies a measure (for example summing an order-level total after joining line items). If a metric such as per-category revenue cannot be computed correctly from available data without an allocation rule, say so or ask for the definition. Never emit plausible but mathematically wrong SQL.
+- Business definitions (revenue, completed order, units sold, AOV) come from a configurable semantic layer / schema metadata, not universal assumptions.
+- **SQL semantic validation** (before execution): entity, metric, aggregation, grouping, filters, scope/reference filters, time range, ranking direction and offset ("second highest" is rank 2, not `LIMIT 1`), limit, joins, no join multiplication. Reject on mismatch and regenerate from the plan; never execute a rejected query.
+- **SQL safety**: read-only (`SELECT`/`WITH`), block INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/CREATE/GRANT/REVOKE, query timeout, row limit, credential redaction, isolated uploaded-DB sessions, prompt-injection resistance.
+- **Result validation** (after execution): shape must match the plan (per-category revenue means one row per category with a numeric measure; "total" means one aggregate value). Do not report success merely because SQL ran.
+- Unknown schema items (suppliers, loyalty_score, ...) must produce an honest "the connected database has no such information", never invented SQL.
+
+## 9. Regression tests (make each one a failing test first, then pass it, without special-casing)
+
+Write these as multi-turn conversation replays asserting on **plan/intent fields and result shape**, not only on SQL text.
+
+1. T1: "give me the product categories that we have" then "category wise revenue generated so far" -> plan is revenue grouped by category (metric=revenue, group_by=category), result has a revenue column, not the category list again.
+2. T2: after T1, "i am asking revenue generated per category" -> treated as a refinement of the same request; still grouped revenue, not a category list.
+3. T3: "what is the highest priced product" (returns product 186) then "its sales" -> `its` resolves to product 186; "sales" is ambiguous (units sold / orders / revenue) so a clarification is expected; must never return `SELECT id, name FROM categories`.
+4. T4: "who is our recent customer" -> clarification about "recent"; reply "last ordered" -> ordering by last order date (recency), **not** most orders. If still ambiguous, clarify again.
+5. T5: after a specific customer is identified, "total revenue generated by her" -> plan scope=SINGLE_PREVIOUS_ENTITY with that customer's ID filter; SQL must filter on it. Global revenue is a failure.
+6. T6: "give me top 10 customers as per number of placed orderes" (note the typo) -> metric=order_count, COUNT of orders, descending, limit 10. Never total spending.
+7. T7: after T6, "revenue we get from them" -> `them` = the 10 customer IDs from Result Context; revenue for those customers (per-customer, with the ambiguity per-customer vs combined handled or clarified). Must not repeat the top-10 spending table.
+8. T8: after T7, "i am asking total" -> refinement: combined revenue of those same 10 customers, one aggregate row. Must not return categories.
+9. T9: "most popular products" earlier in the session, then "give me the most highest priced product" -> ranking by product price. No `total_units_sold` leakage.
+10. Multi-hop: "show the most expensive product" -> "what category is it in?" -> "how much revenue did that category generate?" -> each reference resolves through the chain.
+11. Inheritance: "customers from India" -> "how many are there?" inherits country=India, modifies operation to COUNT. Then "show expensive products" is a NEW_QUERY and resets customer/India.
+12. Refinement: "top 10 customers" -> "actually make that top 5" -> "by order count, not spending" -> "only completed orders" (each turn edits the same plan).
+13. Context switch: "show top customers" -> "forget that, which products are expensive?" (fresh context, then a threshold clarification).
+
+## 10. Generalization tests
+
+- **Paraphrase suites**: for each canonical intent generate at least 5 to 8 paraphrases (highest priced product, top customers by order count, category revenue, and more) and assert the **logical plans are semantically equivalent** (compare plan fields, not SQL strings). Include typos and informal wording.
+- **Unseen queries** (must work from schema + semantics only): average product price per category; customers who bought from at least three categories; products never in a completed order; orders placed by the highest-spending customer; month with highest revenue; percentage of revenue per category; average order value for customers from India vs Germany; customers who ordered in at least three different months; products priced above their category average; category with most unique customers.
+- Also cover: basic retrieval, filters, sorting, top/bottom N, rank offsets, COUNT/SUM/AVG/MIN/MAX, GROUP BY, joins, nested aggregation, time expressions, ratios, no-result cases, unsupported questions, schema mismatch (a DB with `product_cost` instead of `price`), and SQL safety.
+- Run the suite against the sample DB, a SQLite file with a **different** schema, and PostgreSQL if available.
+- Judge success by: intent correct, reference resolved correctly, ambiguity handled correctly, plan correct, SQL semantically valid, result correct, context carried correctly. Not by "SQL executed".
+
+## 11. Frontend
+
+Show semantic information instead of raw internals: Intent (Ranking / Aggregation / Clarification Required), Entity, Metric, Direction, Limit, Grouped by, Scope (for example "applied to the 10 customers from the previous result"). Clarification card with option buttons **plus** a free-text box. Do not expose hidden chain-of-thought. A "New topic / reset context" control is a good addition.
+
+## 12. Deliverables and working method
+
+1. Phase 1 findings (architecture summary, root causes, reproduced failures) before changing code.
+2. Implement in small, tested steps: state models -> classifier -> inheritance -> reference resolver -> clarification state -> planner -> validators -> compiler -> result validation -> UI.
+3. Add a conversation-replay test harness so multi-turn scenarios are easy to add. Include a mock/recorded LLM mode so tests are deterministic, plus a live-LLM evaluation run.
+4. Run the application end to end and manually replay T1 to T9 plus the multi-hop chain in the UI. Report actual outputs.
+5. Final report: what changed, remaining known limitations, and a table of every test with pass/fail. Do not claim success for any scenario you have not run.
+
+**Acceptance bar:** ordinary questions work; follow-ups inherit only relevant context; pronouns and scope resolve correctly; corrections override old intent; context switches reset; explicit metrics are preserved; ambiguity triggers targeted clarification with free-text support; no join-multiplication errors; previous SQL is never used as memory; unseen and paraphrased queries work; the system can honestly say "I need clarification" or "the database cannot answer this".
